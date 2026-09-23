@@ -49,7 +49,8 @@ docker compose up --build
 
 服务在 <http://localhost:8000> 启动，交互式文档：<http://localhost:8000/docs>。
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
-启动方式无需改动，新增的 `POST /api/v1/audits/diff` 随服务一起可用。
+启动方式无需改动，新增的 `POST /api/v1/audits/diff` 与 `POST /api/v1/audits/json`
+随服务一起可用。
 
 ### 仅用 Docker
 
@@ -282,6 +283,163 @@ curl -s -X POST http://localhost:8000/api/v1/audits/diff \
 
 校验在任何写入之前完成：解析或 hunk 计数失败时**不写入任何记录**（多文件 diff 中
 后置文件出错，前面的文件同样不会落库）。
+
+### `POST /api/v1/audits/json` — 原始 JSON 文档逐值审计
+
+接收一段**原始 JSON 文档字符串**作为请求体（直接 `POST` JSON 本身，
+`Content-Type: application/json`；不要包一层 `{"document": ...}`），用严格
+RFC 8259 扫描器校验后，**递归审计任意深度对象/数组中的每个字符串「值」**：
+对象的**键永不参与审计**，数字、`true`/`false`/`null` 也不产生记录。每个字符串值
+各保存一条审计记录（解码后的值存入 `raw_text`，JSON Pointer / 原文偏移 / 回映射存入
+`meta`，可通过 `GET /api/v1/audits/{id}` 取回），该记录同样支持 `verify` 与 `sarif`。
+
+每条结果都带三类定位信息：
+
+- `json_pointer` — 该字符串值的 [RFC 6901](https://datatracker.ietf.org/doc/html/rfc6901)
+  JSON Pointer（键中的 `~` / `/` 转义为 `~0` / `~1`；根字符串标量的 Pointer 为空串 `""`）；
+- `string_offsets.start` / `.end` — 字符串 token 在**原文**中的码点偏移：`start` 指向开引号，
+  `end` 指向闭引号之后一个字符（切片 `原文[start:end]` 恰好得到含引号的完整 token）；
+- `locations` — 复用与 `/audits` 完全相同的 bidi 解析结果（键为解码后字符串内的
+  `logical_index`），并把每个命中的控制符/错误/危险区段映射回**原文行列**：
+  - 普通字符命中：映射到该字符自身的位置；
+  - `\u202E` 这类 **`\u` 转义命中**：映射到转义序列的**反斜杠**位置，并标记
+    `"escaped": true`（行列落在反斜杠上，而不是解码后的字符上）；
+  - **UTF-16 代理对**（如 `😀` 写成 `\uD83D\uDE00`）正确解码为单个码点，映射到代理对起点；
+  - 普通转义（`\n`、`\"`、`\\`、`\/`、`\t` 等）解码后不是双向控制符，**不会误报**；
+  - 键（即使键里写了 `\u202E`）**不会误报**。
+
+`docker compose up --build` 启动后，服务监听宿主机 **8000 端口**，直接向
+<http://localhost:8000/api/v1/audits/json> 发请求即可：
+
+```bash
+cat > evil-config.json <<'JSON'
+{
+  "name": "‮good.exe",
+  "links": ["safe", "x‮bad.js‬"]
+}
+JSON
+
+curl -s -X POST http://localhost:8000/api/v1/audits/json \
+  -H 'Content-Type: application/json' \
+  --data-binary @evil-config.json | jq
+```
+
+响应（节选；上面的文档里第 2 行 `name` 的 RLO 未闭合 → critical，第 3 行第二个
+数组元素含一对 RLO/PDF → high）：
+
+```json
+{
+  "stored": true,
+  "value_count": 3,
+  "risk_level": "critical",
+  "items": [
+    {
+      "id": 1,
+      "stored": true,
+      "json_pointer": "/name",
+      "string_offsets": {"start": 12, "end": 23},
+      "text_length": 9,
+      "risk_level": "critical",
+      "max_depth": 1,
+      "error_count": 1,
+      "control_count": 1,
+      "dangerous_span_count": 1,
+      "locations": {
+        "controls": [
+          {
+            "result_index": 0,
+            "logical_index": 0,
+            "pointer": "/name",
+            "source_offset": 13,
+            "escaped": false,
+            "position": {"line": 2, "column": 12}
+          }
+        ],
+        "errors": [
+          {
+            "result_index": 0,
+            "pointer": "/name",
+            "message": "RLO at logical index 0 (line 1, col 1) is never closed by PDF",
+            "logical_index": 0,
+            "source_offset": 13,
+            "position": {"line": 2, "column": 12}
+          }
+        ],
+        "dangerous_spans": [
+          {
+            "result_index": 0,
+            "pointer": "/name",
+            "start_logical_index": 0,
+            "end_logical_index": 9,
+            "source_offsets": {"start": 13, "end": 22},
+            "position": {"start": {"line": 2, "column": 12},
+                         "end": {"line": 2, "column": 21}}
+          }
+        ]
+      },
+      "result": { "…": "同 /audits 的原始解析结果（作用于解码后的字符串值）" }
+    },
+    {"json_pointer": "/links/0", "risk_level": "info", "control_count": 0, "…": "…"},
+    {"json_pointer": "/links/1", "risk_level": "high",  "control_count": 2, "…": "…"}
+  ]
+}
+```
+
+转义形式命中的例子：文档里写的是 `\u202E` 六个字符时，命中的行列定位到反斜杠：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/audits/json \
+  -H 'Content-Type: application/json' \
+  --data-raw '{"a": "x\u202Ey\u202C"}' | jq '.items[0].locations.controls'
+```
+
+```json
+[
+  {"result_index": 0, "logical_index": 1, "pointer": "/a",
+   "source_offset": 8, "escaped": true,  "position": {"line": 1, "column": 9}},
+  {"result_index": 1, "logical_index": 3, "pointer": "/a",
+   "source_offset": 15, "escaped": true, "position": {"line": 1, "column": 16}}
+]
+```
+
+说明：
+
+- `result` 作用于**解码后的字符串值**（`length` / `logical_index` 均为码点偏移），
+  与 `POST /api/v1/audits` 提交解码后字符串的结果完全一致；原文相关信息全部放在
+  `string_offsets` 与 `locations` 中。
+- 嵌套对象与数组的 Pointer 按出现顺序生成：`/a/0/nested/2` 表示对象键 `a` 下数组
+  下标 0 的对象键 `nested` 下数组下标 2。
+- 空对象 `{}`、空数组 `[]`、根标量（如 `123` / `"safe"`）均为合法文档；不含字符串值时
+  返回 201、`value_count: 0`、`risk_level: "info"`，不落任何记录。
+- 扫描器为严格 RFC 8259：拒绝 `NaN`/`Infinity`、注释、单引号、尾随逗号、前导零数字、
+  文档后多余字符、字符串内裸控制字符与 BOM；`\u` 转义必须是 4 位十六进制；
+  **未配对的 UTF-16 代理项**也拒绝（解码值需按 UTF-8 逐字存储）。
+
+错误情况：
+
+| 状态码 | 条件 |
+|---|---|
+| `422` | 文档不是合法 JSON（`error: "invalid_json"`，含空请求体、非法转义、未配对代理项、非 UTF-8 字节） |
+| `422` | 对象出现重复键（`error: "duplicate_json_key"`，解码后比较，如 `"a"` 与 `\u0061` 视为同键） |
+
+错误响应给出首个问题的原文码点偏移 `offset` 与 1 起始 `position.line/column`，
+重复键另附 `key` 与 `pointer`：
+
+```json
+{
+  "detail": {
+    "error": "duplicate_json_key",
+    "message": "duplicate object key 'a' (first occurrence at offset 1)",
+    "offset": 7,
+    "position": {"line": 1, "column": 8},
+    "key": "a",
+    "pointer": "/a"
+  }
+}
+```
+
+与 diff 接口相同：**校验在任何写入之前完成**——非法 JSON 或重复键时不写入任何记录，
+即使文档前半部分已经解析出命中字符串（全部解析通过后才统一落库）。
 
 ### `GET /api/v1/audits` — 查询历史记录
 
@@ -590,6 +748,7 @@ print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, ind
 │   ├── __init__.py
 │   ├── bidi.py        # UAX#9 控制符解析、配对栈、风险评级、转义预览
 │   ├── diff_audit.py  # unified diff 解析（多文件/多 hunk/No-newline）+ 新增内容回映射
+│   ├── json_audit.py  # 严格 RFC 8259 JSON 扫描（重复键/代理对）+ 逐值审计与原文回映射
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
 │   ├── sarif.py       # 已存审计 -> SARIF 2.1.0（rule/result、UTF-16 列、指纹）
@@ -601,6 +760,7 @@ print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, ind
 │   ├── conftest.py    # 共享的临时 DB / TestClient fixture
 │   ├── test_bidi.py   # 解析器单元测试 + API 冒烟测试
 │   ├── test_diff_audit.py # unified diff 审计（解析/回映射/422/落库）
+│   ├── test_json_audit.py # 原始 JSON 文档审计（指针/偏移/转义回映射/422/落库）
 │   ├── test_compare.py # 回归比较接口测试（新增/消失/位移/配对范围/404/422）
 │   ├── test_verify.py  # 重算校验接口测试（一致/篡改/缺失 vs null/只读/404）
 │   └── test_sarif.py  # SARIF 导出测试（level 映射/UTF-16 列/指纹/排序/404）
@@ -636,7 +796,12 @@ unified diff 审计覆盖多文件/多 hunk 解析、仅分析新增行（删除
 CRLF、git 前缀与引号路径、重命名/删除/新增/空文件、`Binary files` 与
 `GIT binary patch` 段跳过、记录 `meta` 可取回且 verify 仍一致、以及 422 分支
 （空/垃圾输入、hunk 头畸形、缺文件头、体行首非法、标记非法/悬空、头部无 hunk、
-hunk 行数越界指向首个越界行、截断指向 hunk 头、错误落在后续文件时全行不落库）。
+hunk 行数越界指向首个越界行、截断指向 hunk 头、错误落在后续文件时全行不落库）；
+JSON 文档审计覆盖对象/数组任意深度的字符串值发现与键跳过、RFC 6901 指针
+（`~0`/`~1` 转义、根标量空指针）、字符串 token 原文起止偏移、`\u` 转义命中映射到
+反斜杠、UTF-16 代理对解码为单码点、普通转义与键不误报、多行文档行列回映射、
+逐值落库与汇总最高风险、记录可取回且 verify 一致、以及 422 分支（非法 JSON 各形态、
+重复键含转义等价键、未配对代理项、非 UTF-8、BOM、超深嵌套）与失败不落库。
 
 ## 设计说明
 

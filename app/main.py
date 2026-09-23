@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from .bidi import RiskLevel, parse_bidi
 from .compare import compare_audits
 from .database import count_audits, get_audit, init_db, insert_audit, query_audits
 from .diff_audit import DiffParseError, audit_diff, highest_risk
+from .json_audit import JsonParseError, audit_json_document
 from .sarif import build_sarif
 from .schemas import AuditRequest, CompareRequest, DiffAuditRequest
 from .verify import verify_audit_record
@@ -125,6 +126,61 @@ def create_diff_audit(payload: DiffAuditRequest) -> dict:
     }
 
 
+@app.post("/api/v1/audits/json", status_code=201)
+async def create_json_audit(request: Request) -> dict:
+    """Audit every string value of a raw JSON document.
+
+    The request body *is* the JSON document (send it with
+    ``Content-Type: application/json``).  The document is scanned with a
+    strict RFC 8259 parser that rejects duplicate object keys; every
+    string **value** (object keys are never audited) found in objects and
+    arrays at any depth is decoded, run through the bidi parser and
+    persisted as one audit record per value.  Each finding is mapped back
+    to the original document: JSON Pointer, source offsets of the string
+    token, and line/column of every control character (``\\uXXXX`` escapes
+    and UTF-16 surrogate pairs resolve to the offset of their escape).
+
+    An invalid document or a duplicate key yields 422 and writes nothing.
+    """
+    body = await request.body()
+    try:
+        audits = audit_json_document(body)
+    except JsonParseError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail)
+
+    # Only persist after the whole document has scanned and audited
+    # cleanly, so a malformed input never writes partial records.
+    items = []
+    for audit in audits:
+        audit_id = insert_audit(
+            filename=None,
+            text=audit.text,
+            result=audit.result,
+            meta=audit.meta,
+        )
+        items.append({
+            "id": audit_id,
+            "stored": True,
+            "json_pointer": audit.pointer,
+            "string_offsets": {"start": audit.start, "end": audit.end},
+            "text_length": audit.result["length"],
+            "risk_level": audit.result["risk_level"],
+            "max_depth": audit.result["max_depth"],
+            "error_count": audit.result["error_count"],
+            "control_count": audit.result["stats"]["total_control_chars"],
+            "dangerous_span_count": audit.result["stats"]["dangerous_span_count"],
+            "locations": audit.locations,
+            "result": audit.result,
+        })
+
+    return {
+        "stored": True,
+        "value_count": len(items),
+        "risk_level": highest_risk([item["risk_level"] for item in items]),
+        "items": items,
+    }
+
+
 @app.get("/api/v1/audits")
 def list_audits(
     risk_level: Optional[RiskLevel] = Query(
@@ -195,6 +251,7 @@ def root() -> dict:
         "endpoints": [
             "POST /api/v1/audits",
             "POST /api/v1/audits/diff",
+            "POST /api/v1/audits/json",
             "POST /api/v1/audits/compare",
             "GET  /api/v1/audits",
             "GET  /api/v1/audits/{id}",
