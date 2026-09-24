@@ -11,8 +11,19 @@ from .bidi import RiskLevel, parse_bidi
 from .compare import compare_audits
 from .database import count_audits, get_audit, init_db, insert_audit, query_audits
 from .diff_audit import DiffParseError, audit_diff, highest_risk
+from .json_audit import (
+    DuplicateKeyError,
+    JsonParseError,
+    audit_json_document,
+    line_col,
+)
 from .sarif import build_sarif
-from .schemas import AuditRequest, CompareRequest, DiffAuditRequest
+from .schemas import (
+    AuditRequest,
+    CompareRequest,
+    DiffAuditRequest,
+    JsonAuditRequest,
+)
 from .verify import verify_audit_record
 
 app = FastAPI(
@@ -125,6 +136,88 @@ def create_diff_audit(payload: DiffAuditRequest) -> dict:
     }
 
 
+@app.post("/api/v1/audits/json", status_code=201)
+def create_json_audit(payload: JsonAuditRequest) -> dict:
+    """Audit every string value of a raw JSON document.
+
+    Parses the document strictly (RFC 8259), recursively walks objects
+    and arrays and runs the bidi parser on every string *value* (object
+    keys are never audited).  Each finding carries the value's RFC 6901
+    JSON Pointer, the string token's start/end offsets in the original
+    document, and every control character's decoded position mapped back
+    to the original document's line/column (``\\u`` escapes and UTF-16
+    surrogate pairs included).  One record is persisted per string
+    value.  Invalid JSON or a duplicate object key yields 422 and writes
+    nothing.
+    """
+    try:
+        audits = audit_json_document(payload.document)
+    except DuplicateKeyError as exc:
+        line, column = line_col(payload.document, exc.offset)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "duplicate_key",
+                "key": exc.key,
+                "pointer": exc.pointer,
+                "offset": exc.offset,
+                "line": line,
+                "column": column,
+                "message": exc.message,
+            },
+        )
+    except JsonParseError as exc:
+        line, column = line_col(payload.document, exc.offset)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_json_document",
+                "offset": exc.offset,
+                "line": line,
+                "column": column,
+                "message": exc.message,
+            },
+        )
+
+    # Only persist after the entire document has parsed and audited
+    # cleanly, so a malformed input never writes partial records.
+    items = []
+    for audit in audits:
+        filename = (
+            f"{payload.filename}#{audit.pointer}"
+            if payload.filename is not None
+            else f"#{audit.pointer}"
+        )
+        audit_id = insert_audit(
+            filename=filename,
+            text=audit.text,
+            result=audit.result,
+            meta=audit.meta,
+        )
+        items.append({
+            "id": audit_id,
+            "stored": True,
+            "pointer": audit.pointer,
+            "span": audit.span,
+            "text_length": audit.result["length"],
+            "risk_level": audit.result["risk_level"],
+            "max_depth": audit.result["max_depth"],
+            "error_count": audit.result["error_count"],
+            "control_count": audit.result["stats"]["total_control_chars"],
+            "dangerous_span_count":
+                audit.result["stats"]["dangerous_span_count"],
+            "result": audit.result,
+            "locations": audit.locations,
+        })
+
+    return {
+        "stored": True,
+        "value_count": len(items),
+        "risk_level": highest_risk([item["risk_level"] for item in items]),
+        "items": items,
+    }
+
+
 @app.get("/api/v1/audits")
 def list_audits(
     risk_level: Optional[RiskLevel] = Query(
@@ -195,6 +288,7 @@ def root() -> dict:
         "endpoints": [
             "POST /api/v1/audits",
             "POST /api/v1/audits/diff",
+            "POST /api/v1/audits/json",
             "POST /api/v1/audits/compare",
             "GET  /api/v1/audits",
             "GET  /api/v1/audits/{id}",

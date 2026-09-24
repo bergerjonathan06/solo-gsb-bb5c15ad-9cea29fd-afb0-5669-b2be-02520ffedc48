@@ -43,3 +43,23 @@ class DiffAuditRequest(BaseModel):
             "context lines are ignored."
         ),
     )
+
+
+class JsonAuditRequest(BaseModel):
+    document: str = Field(
+        ...,
+        description=(
+            "Raw JSON document text. Parsed strictly (RFC 8259): duplicate "
+            "object keys and malformed input are rejected with 422. Every "
+            "string value (object values and array elements, never object "
+            "keys) is audited for bidi controls."
+        ),
+    )
+    filename: Optional[str] = Field(
+        default=None,
+        max_length=4096,
+        description=(
+            "Optional document name. Stored records are named "
+            "'<filename>#<json-pointer>' ('#<json-pointer>' when omitted)."
+        ),
+    )

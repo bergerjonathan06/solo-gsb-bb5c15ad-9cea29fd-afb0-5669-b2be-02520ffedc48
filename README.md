@@ -49,7 +49,8 @@ docker compose up --build
 
 服务在 <http://localhost:8000> 启动，交互式文档：<http://localhost:8000/docs>。
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
-启动方式无需改动，新增的 `POST /api/v1/audits/diff` 随服务一起可用。
+启动方式无需改动，新增的 `POST /api/v1/audits/diff` 与 `POST /api/v1/audits/json`
+随服务一起可用（均通过宿主机 8000 端口访问）。
 
 ### 仅用 Docker
 
@@ -282,6 +283,103 @@ curl -s -X POST http://localhost:8000/api/v1/audits/diff \
 
 校验在任何写入之前完成：解析或 hunk 计数失败时**不写入任何记录**（多文件 diff 中
 后置文件出错，前面的文件同样不会落库）。
+
+### `POST /api/v1/audits/json` — JSON 文档字符串值审计
+
+接收一段**原始 JSON 文档文本**（`document` 字段），用严格遵循
+[RFC 8259](https://datatracker.ietf.org/doc/html/rfc8259) 的解析器递归遍历对象与
+数组，对其中每一个**字符串值**运行 bidi 解析（**对象的键只参与解析，绝不审计**），
+并为每个字符串值**各保存一条审计记录**。
+
+每个字符串值返回：
+
+- `pointer` — 该值的 [RFC 6901](https://datatracker.ietf.org/doc/html/rfc6901)
+  JSON Pointer（键中的 `~` / `/` 转义为 `~0` / `~1`，数组元素用十进制下标；
+  文档本身即字符串时为空串 `""`）；
+- `span` — 字符串 token 在**原文中的起止偏移**（码点偏移，0 起始、end 排他，
+  含两侧引号）；
+- `locations` — 每个控制符 / 错误 / 危险区段的**解码位置回映射**：`offset` 为原文
+  码点偏移，`position` 为原文的 1 起始行列。`\uXXXX` 转义解码出的控制符定位到
+  该转义的反斜杠；UTF-16 代理对（如 `\uD83D\uDE00`）解码为单个字符，定位到首个
+  反斜杠；普通转义（`\n`、`\\`、`\/` 等）与键不会被误判为命中。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/audits/json \
+  -H 'Content-Type: application/json' \
+  -d '{"document": "{\"name\": \"x\\u202Eevil.exe\\u202C\"}", "filename": "app.json"}' | jq
+```
+
+响应（节选）：
+
+```json
+{
+  "stored": true,
+  "value_count": 1,
+  "risk_level": "high",
+  "items": [
+    {
+      "id": 21,
+      "stored": true,
+      "pointer": "/name",
+      "span": {"start": 9, "end": 32},
+      "text_length": 11,
+      "risk_level": "high",
+      "control_count": 2,
+      "locations": {
+        "controls": [
+          {"result_index": 0, "logical_index": 1, "pointer": "/name",
+           "offset": 11, "position": {"line": 1, "column": 12}}
+        ],
+        "errors": [],
+        "dangerous_spans": [
+          {"result_index": 0, "start_logical_index": 1, "end_logical_index": 10,
+           "pointer": "/name",
+           "offsets": {"start": 11, "end": 25},
+           "position": {"start": {"line": 1, "column": 12},
+                        "end": {"line": 1, "column": 26}}}
+        ]
+      },
+      "result": { "risk_level": "high", "controls": ["…同 /audits 的原始解析结果…"] }
+    }
+  ]
+}
+```
+
+说明：
+
+- 存入审计表的是**解码后的字符串值**（`raw_text`），因此每条记录同样支持
+  `verify` 与 `sarif`；记录的 `filename` 为 `<filename>#<pointer>`（未提供
+  `filename` 时为 `#<pointer>`），`meta` 中保存 `pointer` / `span` / `locations`。
+- 数字、布尔、`null` 不产生记录；文档不含任何字符串值时返回 201、
+  `value_count: 0`、`risk_level: "info"`。
+- 行列与偏移均按 **Unicode 码点**计算（与 `/api/v1/audits` 的 `logical_index`
+  一致），列 1 起始。
+- 嵌套深度上限为 256 层，超出按非法文档处理。
+
+错误情况（均返回 `422` 且**不写入任何记录**——整个文档先解析校验通过后才逐值落库，
+重复键出现在文档末尾时前面的值同样不会落库）：
+
+| `detail.error` | 条件 |
+|---|---|
+| `invalid_json_document` | 非法 JSON：截断/多余内容、非法转义、`\u` 非 4 位十六进制、孤立 UTF-16 代理项、字符串内未转义控制字符、数字格式错误、嵌套超深等 |
+| `duplicate_key` | 同一对象内出现重复键（按**解码后**的键名比较，`"a"` 与 `"\u0061"` 视为重复） |
+
+```json
+{
+  "detail": {
+    "error": "duplicate_key",
+    "key": "a",
+    "pointer": "",
+    "offset": 9,
+    "line": 1,
+    "column": 10,
+    "message": "duplicate object key 'a' in object <root>"
+  }
+}
+```
+
+`invalid_json_document` 的 `detail` 含 `offset`（出错位置的码点偏移）与
+`line` / `column`（1 起始）。
 
 ### `GET /api/v1/audits` — 查询历史记录
 
@@ -590,6 +688,7 @@ print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, ind
 │   ├── __init__.py
 │   ├── bidi.py        # UAX#9 控制符解析、配对栈、风险评级、转义预览
 │   ├── diff_audit.py  # unified diff 解析（多文件/多 hunk/No-newline）+ 新增内容回映射
+│   ├── json_audit.py  # 严格 JSON 解析（位置跟踪/转义解码/重复键）+ 字符串值回映射
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
 │   ├── sarif.py       # 已存审计 -> SARIF 2.1.0（rule/result、UTF-16 列、指纹）
@@ -601,6 +700,7 @@ print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, ind
 │   ├── conftest.py    # 共享的临时 DB / TestClient fixture
 │   ├── test_bidi.py   # 解析器单元测试 + API 冒烟测试
 │   ├── test_diff_audit.py # unified diff 审计（解析/回映射/422/落库）
+│   ├── test_json_audit.py # JSON 文档审计（指针/偏移/转义/代理对/重复键/422）
 │   ├── test_compare.py # 回归比较接口测试（新增/消失/位移/配对范围/404/422）
 │   ├── test_verify.py  # 重算校验接口测试（一致/篡改/缺失 vs null/只读/404）
 │   └── test_sarif.py  # SARIF 导出测试（level 映射/UTF-16 列/指纹/排序/404）
@@ -636,7 +736,14 @@ unified diff 审计覆盖多文件/多 hunk 解析、仅分析新增行（删除
 CRLF、git 前缀与引号路径、重命名/删除/新增/空文件、`Binary files` 与
 `GIT binary patch` 段跳过、记录 `meta` 可取回且 verify 仍一致、以及 422 分支
 （空/垃圾输入、hunk 头畸形、缺文件头、体行首非法、标记非法/悬空、头部无 hunk、
-hunk 行数越界指向首个越界行、截断指向 hunk 头、错误落在后续文件时全行不落库）。
+hunk 行数越界指向首个越界行、截断指向 hunk 头、错误落在后续文件时全行不落库）；
+JSON 文档审计覆盖字符串值递归审计（键不审计）、RFC 6901 指针（`~0`/`~1` 转义与
+数组下标）、字符串 token 起止偏移、控制符/错误/危险区段回映射原文行列、
+`\uXXXX` 转义与 UTF-16 代理对解码定位、普通转义与转义反斜杠不误判、
+多行文档行列、根字符串、纯标量零记录、逐值落库与文件名 `#指针` 规则、
+记录 verify/sarif 一致，以及 422 分支（空文档、截断、非法转义、`\u` 非十六进制、
+孤立高/低代理项、字符串内未转义控制字符、数字格式错误、尾随内容、嵌套超深、
+重复键含解码后重复与嵌套重复——均不落库）。
 
 ## 设计说明
 
